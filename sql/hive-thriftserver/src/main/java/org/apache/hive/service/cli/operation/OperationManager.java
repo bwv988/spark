@@ -39,7 +39,7 @@ import org.apache.hive.service.cli.TableSchema;
 import org.apache.hive.service.cli.session.HiveSession;
 import org.apache.hive.service.rpc.thrift.TRowSet;
 import org.apache.hive.service.rpc.thrift.TTableSchema;
-import org.apache.logging.log4j.core.appender.AbstractWriterAppender;
+import org.apache.logging.log4j.core.Appender;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,7 +48,7 @@ import org.slf4j.LoggerFactory;
  *
  */
 public class OperationManager extends AbstractService {
-  private final Logger LOG = LoggerFactory.getLogger(OperationManager.class.getName());
+  private static final Logger LOG = LoggerFactory.getLogger(OperationManager.class);
 
   private final Map<OperationHandle, Operation> handleToOperation =
       new HashMap<OperationHandle, Operation>();
@@ -82,7 +82,7 @@ public class OperationManager extends AbstractService {
 
   private void initOperationLogCapture(String loggingMode) {
     // Register another Appender (with the same layout) that talks to us.
-    AbstractWriterAppender ap = new LogDivertAppender(this, OperationLog.getLoggingLevel(loggingMode));
+    Appender ap = new LogDivertAppender(this, OperationLog.getLoggingLevel(loggingMode));
     ((org.apache.logging.log4j.core.Logger)org.apache.logging.log4j.LogManager.getRootLogger()).addAppender(ap);
     ap.start();
   }

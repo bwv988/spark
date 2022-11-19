@@ -220,7 +220,10 @@ class SQLAppStatusListener(
             metricAggregationMap.put(className, method)
             method
           } catch {
-            case NonFatal(_) =>
+            case NonFatal(e) =>
+              logWarning(s"Unable to load custom metric object for class `$className`. " +
+                "Please make sure that the custom metric class is in the classpath and " +
+                "it has 0-arg constructor.", e)
               // Cannot initialize custom metric object, we might be in history server that does
               // not have the custom metric class.
               val defaultMethod = (_: Array[Long], _: Array[Long]) => "N/A"
@@ -390,9 +393,10 @@ class SQLAppStatusListener(
   }
 
   private def onExecutionEnd(event: SparkListenerSQLExecutionEnd): Unit = {
-    val SparkListenerSQLExecutionEnd(executionId, time) = event
+    val SparkListenerSQLExecutionEnd(executionId, time, errorMessage) = event
     Option(liveExecutions.get(executionId)).foreach { exec =>
       exec.completionTime = Some(new Date(time))
+      exec.errorMessage = errorMessage
       update(exec)
 
       // Aggregating metrics can be expensive for large queries, so do it asynchronously. The end
@@ -491,6 +495,7 @@ private class LiveExecutionData(val executionId: Long) extends LiveEntity {
   var driverAccumUpdates = Seq[(Long, Long)]()
 
   @volatile var metricsValues: Map[Long, String] = null
+  var errorMessage: Option[String] = None
 
   // Just in case job end and execution end arrive out of order, keep track of how many
   // end events arrived so that the listener can stop tracking the execution.
@@ -508,7 +513,8 @@ private class LiveExecutionData(val executionId: Long) extends LiveEntity {
       completionTime,
       jobs,
       stages,
-      metricsValues)
+      metricsValues,
+      errorMessage)
   }
 
 }

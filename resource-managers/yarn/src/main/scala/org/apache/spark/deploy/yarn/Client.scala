@@ -391,7 +391,7 @@ private[spark] class Client(
           throw new SparkException(s"Cannot find setTokensConf method in ${amContainer.getClass}." +
               s" Please check YARN version and make sure it is 2.9+ or 3.x")
       }
-      setTokensConfMethod.invoke(ByteBuffer.wrap(dob.getData))
+      setTokensConfMethod.invoke(amContainer, ByteBuffer.wrap(dob.getData))
     }
   }
 
@@ -912,6 +912,7 @@ private[spark] class Client(
     populateClasspath(args, hadoopConf, sparkConf, env, sparkConf.get(DRIVER_CLASS_PATH))
     env("SPARK_YARN_STAGING_DIR") = stagingDirPath.toString
     env("SPARK_USER") = UserGroupInformation.getCurrentUser().getShortUserName()
+    env("SPARK_PREFER_IPV6") = Utils.preferIPv6.toString
 
     // Pick up any environment variables for the AM provided through spark.yarn.appMasterEnv.*
     val amEnvPrefix = "spark.yarn.appMasterEnv."
@@ -986,6 +987,8 @@ private[spark] class Client(
     amContainer.setEnvironment(launchEnv.asJava)
 
     val javaOpts = ListBuffer[String]()
+
+    javaOpts += s"-Djava.net.preferIPv6Addresses=${Utils.preferIPv6}"
 
     // SPARK-37106: To start AM with Java 17, `JavaModuleOptions.defaultModuleOptions`
     // is added by default. It will not affect Java 8 and Java 11 due to existence of
@@ -1467,6 +1470,11 @@ private[spark] object Client extends Logging {
       addClasspathEntry(getClusterPath(sparkConf, cp), env)
     }
 
+    val cpSet = extraClassPath match {
+      case Some(classPath) if Utils.isTesting => classPath.split(File.pathSeparator).toSet
+      case _ => Set.empty[String]
+    }
+
     addClasspathEntry(Environment.PWD.$$(), env)
 
     addClasspathEntry(Environment.PWD.$$() + Path.SEPARATOR + LOCALIZED_CONF_DIR, env)
@@ -1510,7 +1518,13 @@ private[spark] object Client extends Logging {
     }
 
     sys.env.get(ENV_DIST_CLASSPATH).foreach { cp =>
-      addClasspathEntry(getClusterPath(sparkConf, cp), env)
+      // SPARK-40635: during the test, add a jar de-duplication process to avoid
+      // that the startup command can't be executed due to the too long classpath.
+      val newCp = if (Utils.isTesting) {
+        cp.split(File.pathSeparator)
+          .filterNot(cpSet.contains).mkString(File.pathSeparator)
+      } else cp
+      addClasspathEntry(getClusterPath(sparkConf, newCp), env)
     }
 
     // Add the localized Hadoop config at the end of the classpath, in case it contains other

@@ -19,15 +19,21 @@ package org.apache.spark.sql.catalyst.util
 
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.Analyzer
+import org.apache.spark.sql.catalyst.analysis._
+import org.apache.spark.sql.catalyst.catalog.{CatalogDatabase, InMemoryCatalog, SessionCatalog}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.{Literal => ExprLiteral}
 import org.apache.spark.sql.catalyst.optimizer.ConstantFolding
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParseException}
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
+import org.apache.spark.sql.connector.catalog.{CatalogManager, FunctionCatalog, Identifier}
+import org.apache.spark.sql.connector.catalog.functions.UnboundFunction
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.connector.V1Function
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 /**
  * This object contains fields to help process DEFAULT columns.
@@ -81,29 +87,41 @@ object ResolveDefaultColumns {
    * data source then takes responsibility to provide the constant-folded value in the
    * EXISTS_DEFAULT metadata for such columns where the value is not present in storage.
    *
-   * @param analyzer      used for analyzing the result of parsing the expression stored as text.
    * @param tableSchema   represents the names and types of the columns of the statement to process.
    * @param tableProvider provider of the target table to store default values for, if any.
    * @param statementType name of the statement being processed, such as INSERT; useful for errors.
+   * @param addNewColumnToExistingTable true if the statement being processed adds a new column to
+   *                                    a table that already exists.
    * @return a copy of `tableSchema` with field metadata updated with the constant-folded values.
    */
   def constantFoldCurrentDefaultsToExistDefaults(
-      analyzer: Analyzer,
       tableSchema: StructType,
       tableProvider: Option[String],
-      statementType: String): StructType = {
+      statementType: String,
+      addNewColumnToExistingTable: Boolean): StructType = {
     if (SQLConf.get.enableDefaultColumns) {
-      val allowedTableProviders: Array[String] =
+      val keywords: Array[String] =
         SQLConf.get.getConf(SQLConf.DEFAULT_COLUMN_ALLOWED_PROVIDERS)
           .toLowerCase().split(",").map(_.trim)
+      val allowedTableProviders: Array[String] =
+        keywords.map(_.stripSuffix("*"))
+      val addColumnExistingTableBannedProviders: Array[String] =
+        keywords.filter(_.endsWith("*")).map(_.stripSuffix("*"))
       val givenTableProvider: String = tableProvider.getOrElse("").toLowerCase()
       val newFields: Seq[StructField] = tableSchema.fields.map { field =>
         if (field.metadata.contains(CURRENT_DEFAULT_COLUMN_METADATA_KEY)) {
           // Make sure that the target table has a provider that supports default column values.
           if (!allowedTableProviders.contains(givenTableProvider)) {
-            throw QueryCompilationErrors.defaultReferencesNotAllowedInDataSource(givenTableProvider)
+            throw QueryCompilationErrors
+              .defaultReferencesNotAllowedInDataSource(statementType, givenTableProvider)
           }
-          val analyzed: Expression = analyze(analyzer, field, statementType)
+          if (addNewColumnToExistingTable &&
+            givenTableProvider.nonEmpty &&
+            addColumnExistingTableBannedProviders.contains(givenTableProvider)) {
+            throw QueryCompilationErrors
+              .addNewDefaultColumnToExistingTableNotAllowed(statementType, givenTableProvider)
+          }
+          val analyzed: Expression = analyze(field, statementType)
           val newMetadata: Metadata = new MetadataBuilder().withMetadata(field.metadata)
             .putString(EXISTS_DEFAULT_COLUMN_METADATA_KEY, analyzed.sql).build()
           field.copy(metadata = newMetadata)
@@ -123,14 +141,16 @@ object ResolveDefaultColumns {
    * @param field         represents the DEFAULT column value whose "default" metadata to parse
    *                      and analyze.
    * @param statementType which type of statement we are running, such as INSERT; useful for errors.
+   * @param metadataKey   which key to look up from the column metadata; generally either
+   *                      CURRENT_DEFAULT_COLUMN_METADATA_KEY or EXISTS_DEFAULT_COLUMN_METADATA_KEY.
    * @return Result of the analysis and constant-folding operation.
    */
   def analyze(
-      analyzer: Analyzer,
       field: StructField,
-      statementType: String): Expression = {
+      statementType: String,
+      metadataKey: String = CURRENT_DEFAULT_COLUMN_METADATA_KEY): Expression = {
     // Parse the expression.
-    val colText: String = field.metadata.getString(CURRENT_DEFAULT_COLUMN_METADATA_KEY)
+    val colText: String = field.metadata.getString(metadataKey)
     lazy val parser = new CatalystSqlParser()
     val parsed: Expression = try {
       parser.parseExpression(colText)
@@ -141,8 +161,13 @@ object ResolveDefaultColumns {
             s"${field.name} has a DEFAULT value of $colText which fails to parse as a valid " +
             s"expression: ${ex.getMessage}")
     }
+    // Check invariants before moving on to analysis.
+    if (parsed.containsPattern(PLAN_EXPRESSION)) {
+      throw QueryCompilationErrors.defaultValuesMayNotContainSubQueryExpressions()
+    }
     // Analyze the parse result.
     val plan = try {
+      val analyzer: Analyzer = DefaultColumnAnalyzer
       val analyzed = analyzer.execute(Project(Seq(Alias(parsed, field.name)()), OneRowRelation()))
       analyzer.checkAnalysis(analyzed)
       ConstantFolding(analyzed)
@@ -196,12 +221,12 @@ object ResolveDefaultColumns {
       val defaultValue: Option[String] = field.getExistenceDefaultValue()
       defaultValue.map { text: String =>
         val expr = try {
-          val expr = CatalystSqlParser.parseExpression(text)
+          val expr = analyze(field, "", EXISTS_DEFAULT_COLUMN_METADATA_KEY)
           expr match {
             case _: ExprLiteral | _: Cast => expr
           }
         } catch {
-          case _: ParseException | _: MatchError =>
+          case _: AnalysisException | _: MatchError =>
             throw QueryCompilationErrors.failedToParseExistenceDefaultAsLiteral(field.name, text)
         }
         // The expression should be a literal value by this point, possibly wrapped in a cast
@@ -239,6 +264,37 @@ object ResolveDefaultColumns {
           row.update(i, schema.existenceDefaultValues(i))
         }
       }
+    }
+  }
+
+  /**
+   * This is an Analyzer for processing default column values using built-in functions only.
+   */
+  object DefaultColumnAnalyzer extends Analyzer(
+    new CatalogManager(BuiltInFunctionCatalog, BuiltInFunctionCatalog.v1Catalog)) {
+  }
+
+  /**
+   * This is a FunctionCatalog for performing analysis using built-in functions only. It is a helper
+   * for the DefaultColumnAnalyzer above.
+   */
+  object BuiltInFunctionCatalog extends FunctionCatalog {
+    val v1Catalog = new SessionCatalog(
+      new InMemoryCatalog, FunctionRegistry.builtin, TableFunctionRegistry.builtin) {
+      override def createDatabase(
+          dbDefinition: CatalogDatabase, ignoreIfExists: Boolean): Unit = {}
+    }
+    import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
+    override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = {}
+    override def name(): String = CatalogManager.SESSION_CATALOG_NAME
+    override def listFunctions(namespace: Array[String]): Array[Identifier] = {
+      throw new UnsupportedOperationException()
+    }
+    override def loadFunction(ident: Identifier): UnboundFunction = {
+      V1Function(v1Catalog.lookupPersistentFunction(ident.asFunctionIdentifier))
+    }
+    override def functionExists(ident: Identifier): Boolean = {
+      v1Catalog.isPersistentFunction(ident.asFunctionIdentifier)
     }
   }
 }

@@ -17,15 +17,25 @@
 
 package org.apache.spark.sql.connector.util;
 
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.StringJoiner;
 
 import org.apache.spark.sql.connector.expressions.Cast;
 import org.apache.spark.sql.connector.expressions.Expression;
+import org.apache.spark.sql.connector.expressions.Extract;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.GeneralScalarExpression;
 import org.apache.spark.sql.connector.expressions.Literal;
+import org.apache.spark.sql.connector.expressions.UserDefinedScalarFunc;
+import org.apache.spark.sql.connector.expressions.aggregate.Avg;
+import org.apache.spark.sql.connector.expressions.aggregate.Max;
+import org.apache.spark.sql.connector.expressions.aggregate.Min;
+import org.apache.spark.sql.connector.expressions.aggregate.Count;
+import org.apache.spark.sql.connector.expressions.aggregate.CountStar;
+import org.apache.spark.sql.connector.expressions.aggregate.GeneralAggregateFunc;
+import org.apache.spark.sql.connector.expressions.aggregate.Sum;
+import org.apache.spark.sql.connector.expressions.aggregate.UserDefinedAggregateFunc;
 import org.apache.spark.sql.types.DataType;
 
 /**
@@ -37,20 +47,23 @@ public class V2ExpressionSQLBuilder {
 
   public String build(Expression expr) {
     if (expr instanceof Literal) {
-      return visitLiteral((Literal) expr);
+      return visitLiteral((Literal<?>) expr);
     } else if (expr instanceof NamedReference) {
       return visitNamedReference((NamedReference) expr);
     } else if (expr instanceof Cast) {
       Cast cast = (Cast) expr;
       return visitCast(build(cast.expression()), cast.dataType());
+    } else if (expr instanceof Extract) {
+      Extract extract = (Extract) expr;
+      return visitExtract(extract.field(), build(extract.source()));
     } else if (expr instanceof GeneralScalarExpression) {
       GeneralScalarExpression e = (GeneralScalarExpression) expr;
       String name = e.name();
       switch (name) {
         case "IN": {
-          List<String> children =
-            Arrays.stream(e.children()).map(c -> build(c)).collect(Collectors.toList());
-          return visitIn(children.get(0), children.subList(1, children.size()));
+          Expression[] expressions = e.children();
+          List<String> children = expressionsToStringList(expressions, 1, expressions.length - 1);
+          return visitIn(build(expressions[0]), children);
         }
         case "IS_NULL":
           return visitIsNull(build(e.children()[0]));
@@ -97,46 +110,110 @@ public class V2ExpressionSQLBuilder {
           return visitUnaryArithmetic(name, inputToSQL(e.children()[0]));
         case "ABS":
         case "COALESCE":
+        case "GREATEST":
+        case "LEAST":
+        case "RAND":
+        case "LOG":
+        case "LOG10":
+        case "LOG2":
         case "LN":
         case "EXP":
         case "POWER":
         case "SQRT":
         case "FLOOR":
         case "CEIL":
+        case "ROUND":
+        case "SIN":
+        case "SINH":
+        case "COS":
+        case "COSH":
+        case "TAN":
+        case "TANH":
+        case "COT":
+        case "ASIN":
+        case "ASINH":
+        case "ACOS":
+        case "ACOSH":
+        case "ATAN":
+        case "ATANH":
+        case "ATAN2":
+        case "CBRT":
+        case "DEGREES":
+        case "RADIANS":
+        case "SIGN":
         case "WIDTH_BUCKET":
         case "SUBSTRING":
         case "UPPER":
         case "LOWER":
         case "TRANSLATE":
-          return visitSQLFunction(name,
-            Arrays.stream(e.children()).map(c -> build(c)).toArray(String[]::new));
+        case "DATE_ADD":
+        case "DATE_DIFF":
+        case "TRUNC":
+        case "AES_ENCRYPT":
+        case "AES_DECRYPT":
+        case "SHA1":
+        case "SHA2":
+        case "MD5":
+        case "CRC32":
+        case "BIT_LENGTH":
+        case "CHAR_LENGTH":
+        case "CONCAT":
+          return visitSQLFunction(name, expressionsToStringArray(e.children()));
         case "CASE_WHEN": {
-          List<String> children =
-            Arrays.stream(e.children()).map(c -> build(c)).collect(Collectors.toList());
-          return visitCaseWhen(children.toArray(new String[e.children().length]));
+          return visitCaseWhen(expressionsToStringArray(e.children()));
         }
         case "TRIM":
-          return visitTrim("BOTH",
-            Arrays.stream(e.children()).map(c -> build(c)).toArray(String[]::new));
+          return visitTrim("BOTH", expressionsToStringArray(e.children()));
         case "LTRIM":
-          return visitTrim("LEADING",
-            Arrays.stream(e.children()).map(c -> build(c)).toArray(String[]::new));
+          return visitTrim("LEADING", expressionsToStringArray(e.children()));
         case "RTRIM":
-          return visitTrim("TRAILING",
-            Arrays.stream(e.children()).map(c -> build(c)).toArray(String[]::new));
+          return visitTrim("TRAILING", expressionsToStringArray(e.children()));
         case "OVERLAY":
-          return visitOverlay(
-            Arrays.stream(e.children()).map(c -> build(c)).toArray(String[]::new));
+          return visitOverlay(expressionsToStringArray(e.children()));
         // TODO supports other expressions
         default:
           return visitUnexpectedExpr(expr);
       }
+    } else if (expr instanceof Min) {
+      Min min = (Min) expr;
+      return visitAggregateFunction("MIN", false,
+        expressionsToStringArray(min.children()));
+    } else if (expr instanceof Max) {
+      Max max = (Max) expr;
+      return visitAggregateFunction("MAX", false,
+        expressionsToStringArray(max.children()));
+    } else if (expr instanceof Count) {
+      Count count = (Count) expr;
+      return visitAggregateFunction("COUNT", count.isDistinct(),
+        expressionsToStringArray(count.children()));
+    } else if (expr instanceof Sum) {
+      Sum sum = (Sum) expr;
+      return visitAggregateFunction("SUM", sum.isDistinct(),
+        expressionsToStringArray(sum.children()));
+    } else if (expr instanceof CountStar) {
+      return visitAggregateFunction("COUNT", false, new String[]{"*"});
+    } else if (expr instanceof Avg) {
+      Avg avg = (Avg) expr;
+      return visitAggregateFunction("AVG", avg.isDistinct(),
+        expressionsToStringArray(avg.children()));
+    } else if (expr instanceof GeneralAggregateFunc) {
+      GeneralAggregateFunc f = (GeneralAggregateFunc) expr;
+      return visitAggregateFunction(f.name(), f.isDistinct(),
+        expressionsToStringArray(f.children()));
+    } else if (expr instanceof UserDefinedScalarFunc) {
+      UserDefinedScalarFunc f = (UserDefinedScalarFunc) expr;
+      return visitUserDefinedScalarFunction(f.name(), f.canonicalName(),
+        expressionsToStringArray(f.children()));
+    } else if (expr instanceof UserDefinedAggregateFunc) {
+      UserDefinedAggregateFunc f = (UserDefinedAggregateFunc) expr;
+      return visitUserDefinedAggregateFunction(f.name(), f.canonicalName(), f.isDistinct(),
+        expressionsToStringArray(f.children()));
     } else {
       return visitUnexpectedExpr(expr);
     }
   }
 
-  protected String visitLiteral(Literal literal) {
+  protected String visitLiteral(Literal<?> literal) {
     return literal.toString();
   }
 
@@ -148,7 +225,7 @@ public class V2ExpressionSQLBuilder {
     if (list.isEmpty()) {
       return "CASE WHEN " + v + " IS NULL THEN NULL ELSE FALSE END";
     }
-    return v + " IN (" + list.stream().collect(Collectors.joining(", ")) + ")";
+    return joinListToString(list, ", ", v + " IN (", ")");
   }
 
   protected String visitIsNull(String v) {
@@ -240,7 +317,28 @@ public class V2ExpressionSQLBuilder {
   }
 
   protected String visitSQLFunction(String funcName, String[] inputs) {
-    return funcName + "(" + Arrays.stream(inputs).collect(Collectors.joining(", ")) + ")";
+    return joinArrayToString(inputs, ", ", funcName + "(", ")");
+  }
+
+  protected String visitAggregateFunction(
+      String funcName, boolean isDistinct, String[] inputs) {
+    if (isDistinct) {
+      return joinArrayToString(inputs, ", ", funcName + "(DISTINCT ", ")");
+    } else {
+      return joinArrayToString(inputs, ", ", funcName + "(", ")");
+    }
+  }
+
+  protected String visitUserDefinedScalarFunction(
+      String funcName, String canonicalName, String[] inputs) {
+    throw new UnsupportedOperationException(
+      this.getClass().getSimpleName() + " does not support user defined function: " + funcName);
+  }
+
+  protected String visitUserDefinedAggregateFunction(
+      String funcName, String canonicalName, boolean isDistinct, String[] inputs) {
+    throw new UnsupportedOperationException(this.getClass().getSimpleName() +
+      " does not support user defined aggregate function: " + funcName);
   }
 
   protected String visitUnexpectedExpr(Expression expr) throws IllegalArgumentException {
@@ -264,5 +362,45 @@ public class V2ExpressionSQLBuilder {
     } else {
       return "TRIM(" + direction + " " + inputs[1] + " FROM " + inputs[0] + ")";
     }
+  }
+
+  protected String visitExtract(String field, String source) {
+    return "EXTRACT(" + field + " FROM " + source + ")";
+  }
+
+  private String joinArrayToString(
+      String[] inputs, CharSequence delimiter, CharSequence prefix, CharSequence suffix) {
+    StringJoiner joiner = new StringJoiner(delimiter, prefix, suffix);
+    for (String input : inputs) {
+      joiner.add(input);
+    }
+    return joiner.toString();
+  }
+
+  private String joinListToString(
+     List<String> inputs, CharSequence delimiter, CharSequence prefix, CharSequence suffix) {
+    StringJoiner joiner = new StringJoiner(delimiter, prefix, suffix);
+    for (String input : inputs) {
+      joiner.add(input);
+    }
+    return joiner.toString();
+  }
+
+  private String[] expressionsToStringArray(Expression[] expressions) {
+    String[] result = new String[expressions.length];
+    for (int i = 0; i < expressions.length; i++) {
+      result[i] = build(expressions[i]);
+    }
+    return result;
+  }
+
+  private List<String> expressionsToStringList(Expression[] expressions, int offset, int length) {
+    List<String> list = new ArrayList<>(length);
+    final int till = Math.min(offset + length, expressions.length);
+    while (offset < till) {
+      list.add(build(expressions[offset]));
+      offset++;
+    }
+    return list;
   }
 }

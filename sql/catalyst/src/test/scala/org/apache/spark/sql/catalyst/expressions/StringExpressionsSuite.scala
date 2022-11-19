@@ -19,9 +19,11 @@ package org.apache.spark.sql.catalyst.expressions
 
 import java.math.{BigDecimal => JavaBigDecimal}
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkFunSuite, SparkIllegalArgumentException}
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
 import org.apache.spark.sql.catalyst.dsl.expressions._
+import org.apache.spark.sql.catalyst.expressions.Cast._
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
@@ -305,6 +307,17 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     // scalastyle:on
     checkEvaluation(
       SubstringIndex(Literal("www||apache||org"), Literal( "||"), Literal(2)), "www||apache")
+  }
+
+  test("SPARK-40213: ascii for Latin-1 Supplement characters") {
+    // scalastyle:off
+    checkEvaluation(Ascii(Literal("¥")), 165, create_row("¥"))
+    checkEvaluation(Ascii(Literal("®")), 174, create_row("®"))
+    checkEvaluation(Ascii(Literal("©")), 169, create_row("©"))
+    // scalastyle:on
+    (128 until 256).foreach { c =>
+      checkEvaluation(Ascii(Chr(Literal(c.toLong))), c, create_row(c.toLong))
+    }
   }
 
   test("ascii for string") {
@@ -969,7 +982,8 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       ("+$89,1,2,3,45.123", "S$999,0,0,0,999.00000") -> Decimal(8912345.123),
       ("-454", "S999") -> Decimal(-454),
       ("+454", "S999") -> Decimal(454),
-      ("<454>", "999PR") -> Decimal(-454),
+      ("454", "999PR") -> Decimal(454),
+      (" 454 ", "999PR") -> Decimal(454),
       ("454-", "999MI") -> Decimal(-454),
       ("-$54", "MI$99") -> Decimal(-54),
       // The input string contains more digits than fit in a long integer.
@@ -1008,82 +1022,173 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("ToNumber and ToCharacter: negative tests (the format string is invalid)") {
-    val unexpectedCharacter = "the structure of the format string must match: " +
-      "[MI|S] [$] [0|9|G|,]* [.|D] [0|9]* [$] [PR|MI|S]"
-    val thousandsSeparatorDigitsBetween =
-      "Thousands separators (, or G) must have digits in between them"
-    val mustBeAtEnd = "must be at the end of the number format"
-    val atMostOne = "At most one"
     Seq(
       // The format string must not be empty.
-      ("454", "") -> "The format string cannot be empty",
+      ("454", "") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_EMPTY",
+        messageParameters = Map.empty),
       // Make sure the format string does not contain any unrecognized characters.
-      ("454", "999@") -> unexpectedCharacter,
-      ("454", "999M") -> unexpectedCharacter,
-      ("454", "999P") -> unexpectedCharacter,
+      ("454", "999@") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_UNEXPECTED_TOKEN",
+          messageParameters = Map(
+            "token" -> "character '@''",
+            "format" -> toSQLValue("999@", StringType))
+        ),
+      ("454", "999M") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_UNEXPECTED_TOKEN",
+          messageParameters = Map(
+            "token" -> "character 'M''",
+            "format" -> toSQLValue("999M", StringType)
+          )
+        ),
+      ("454", "999P") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_UNEXPECTED_TOKEN",
+          messageParameters = Map(
+            "token" -> "character 'P''",
+            "format" -> toSQLValue("999P", StringType))
+        ),
       // Make sure the format string contains at least one digit.
-      ("454", "$") -> "The format string requires at least one number digit",
+      ("454", "$") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_WRONG_NUM_DIGIT",
+        messageParameters = Map.empty),
       // Make sure the format string contains at most one decimal point.
-      ("454", "99.99.99") -> atMostOne,
+      ("454", "99.99.99") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_WRONG_NUM_TOKEN",
+          messageParameters = Map(
+            "token" -> ". or D",
+            "format" -> toSQLValue("99.99.99", StringType))
+        ),
       // Make sure the format string contains at most one dollar sign.
-      ("454", "$$99") -> atMostOne,
+      ("454", "$$99") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_WRONG_NUM_TOKEN",
+          messageParameters = Map(
+            "token" -> "$", "" +
+            "format" -> toSQLValue("$$99", StringType))
+        ),
       // Make sure the format string contains at most one minus sign at the beginning or end.
-      ("$4-4", "$9MI9") -> unexpectedCharacter,
-      ("--4", "SMI9") -> unexpectedCharacter,
-      ("--$54", "SS$99") -> atMostOne,
-      ("-$54", "MI$99MI") -> atMostOne,
-      ("$4-4", "$9MI9MI") -> atMostOne,
+      ("$4-4", "$9MI9") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_UNEXPECTED_TOKEN",
+          messageParameters = Map(
+            "token" -> "digit sequence",
+            "format" -> toSQLValue("$9MI9", StringType))
+        ),
+      ("--4", "SMI9") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_UNEXPECTED_TOKEN",
+          messageParameters = Map(
+            "token" -> "digit sequence",
+            "format" -> toSQLValue("SMI9", StringType))
+        ),
+      ("--$54", "SS$99") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_WRONG_NUM_TOKEN",
+          messageParameters = Map(
+            "token" -> "S",
+            "format" -> toSQLValue("SS$99", StringType))
+        ),
+      ("-$54", "MI$99MI") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_WRONG_NUM_TOKEN",
+          messageParameters = Map(
+            "token" -> "MI",
+            "format" -> toSQLValue("MI$99MI", StringType))
+        ),
+      ("$4-4", "$9MI9MI") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_WRONG_NUM_TOKEN",
+          messageParameters = Map("token" -> "MI",
+            "format" -> toSQLValue("$9MI9MI", StringType))
+        ),
       // Make sure the format string contains at most one closing angle bracket at the end.
-      ("<$45>", "PR$99") -> unexpectedCharacter,
-      ("$4<4>", "$9PR9") -> unexpectedCharacter,
-      ("<<454>>", "999PRPR") -> atMostOne,
+      ("<$45>", "PR$99") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_UNEXPECTED_TOKEN",
+          messageParameters = Map(
+            "token" -> "$",
+            "format" -> toSQLValue("PR$99", StringType))
+        ),
+      ("$4<4>", "$9PR9") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_UNEXPECTED_TOKEN",
+          messageParameters = Map(
+            "token" -> "digit sequence",
+            "format" -> toSQLValue("$9PR9", StringType))
+        ),
+      ("<<454>>", "999PRPR") ->
+        DataTypeMismatch(
+          errorSubClass = "FORMAT_WRONG_NUM_TOKEN",
+          messageParameters = Map(
+            "token" -> "PR",
+            "format" -> toSQLValue("999PRPR", StringType))
+        ),
       // Make sure that any dollar sign in the format string occurs before any digits.
-      ("4$54", "9$99") -> "Currency characters must appear before digits",
+      ("4$54", "9$99") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_CUR_MUST_BEFORE_DIGIT",
+        messageParameters = Map("format" -> toSQLValue("9$99", StringType))),
       // Make sure that any dollar sign in the format string occurs before any decimal point.
-      (".$99", ".$99") -> "Currency characters must appear before any decimal point",
+      (".$99", ".$99") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_CUR_MUST_BEFORE_DEC",
+        messageParameters = Map("format" -> toSQLValue(".$99", StringType))),
       // Thousands separators must have digits in between them.
-      (",123", ",099") -> thousandsSeparatorDigitsBetween,
-      (",123,456", ",999,099") -> thousandsSeparatorDigitsBetween,
-      (",,345", "9,,09.99") -> thousandsSeparatorDigitsBetween,
-      (",,345", "9,99,.99") -> thousandsSeparatorDigitsBetween,
-      (",,345", "9,99,") -> thousandsSeparatorDigitsBetween,
-      (",,345", ",,999,099.99") -> thousandsSeparatorDigitsBetween,
+      (",123", ",099") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_CONT_THOUSANDS_SEPS",
+        messageParameters = Map("format" -> toSQLValue(",099", StringType))),
+      (",123,456", ",999,099") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_CONT_THOUSANDS_SEPS",
+        messageParameters = Map("format" -> toSQLValue(",999,099", StringType))),
+      (",,345", "9,,09.99") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_CONT_THOUSANDS_SEPS",
+        messageParameters = Map("format" -> toSQLValue("9,,09.99", StringType))),
+      (",,345", "9,99,.99") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_CONT_THOUSANDS_SEPS",
+        messageParameters = Map("format" -> toSQLValue("9,99,.99", StringType))),
+      (",,345", "9,99,") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_CONT_THOUSANDS_SEPS",
+        messageParameters = Map("format" -> toSQLValue("9,99,", StringType))),
+      (",,345", ",,999,099.99") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_CONT_THOUSANDS_SEPS",
+        messageParameters = Map("format" -> toSQLValue(",,999,099.99", StringType))),
       // Thousands separators must not appear after the decimal point.
-      ("123.45,6", "099.99,9") ->
-        "Thousands separators (, or G) may not appear after the decimal point"
-    ).foreach { case ((str: String, format: String), expectedErrMsg: String) =>
+      ("123.45,6", "099.99,9") -> DataTypeMismatch(
+        errorSubClass = "FORMAT_THOUSANDS_SEPS_MUST_BEFORE_DEC",
+        messageParameters = Map("format" -> toSQLValue("099.99,9", StringType)))
+    ).foreach { case ((str: String, format: String), dataTypeMismatch: DataTypeMismatch) =>
       val toNumberResult = ToNumber(Literal(str), Literal(format)).checkInputDataTypes()
       assert(toNumberResult != TypeCheckResult.TypeCheckSuccess,
         s"The format string should have been invalid: $format")
-      toNumberResult match {
-        case TypeCheckResult.TypeCheckFailure(message) =>
-          assert(message.contains(expectedErrMsg))
-      }
+      assert(toNumberResult == dataTypeMismatch)
 
       val tryToNumberResult = TryToNumber(Literal(str), Literal(format)).checkInputDataTypes()
       assert(tryToNumberResult != TypeCheckResult.TypeCheckSuccess,
         s"The format string should have been invalid: $format")
-      tryToNumberResult match {
-        case TypeCheckResult.TypeCheckFailure(message) =>
-          assert(message.contains(expectedErrMsg))
-      }
+      assert(tryToNumberResult == dataTypeMismatch)
 
       val toCharResult = ToCharacter(Decimal(456), Literal(format)).checkInputDataTypes()
       assert(toCharResult != TypeCheckResult.TypeCheckSuccess,
         s"The format string should have been invalid: $format")
-      toCharResult match {
-        case TypeCheckResult.TypeCheckFailure(message) =>
-          assert(message.contains(expectedErrMsg))
-      }
-
-      val tryToCharResult = TryToCharacter(Decimal(456), Literal(format)).checkInputDataTypes()
-      assert(tryToCharResult != TypeCheckResult.TypeCheckSuccess,
-        s"The format string should have been invalid: $format")
-      tryToCharResult match {
-        case TypeCheckResult.TypeCheckFailure(message) =>
-          assert(message.contains(expectedErrMsg))
-      }
+      assert(toCharResult == dataTypeMismatch)
     }
+  }
+
+  test("ToCharacter: fails analysis if numberFormat is not foldable") {
+    val right = AttributeReference("a", StringType)()
+    val toCharacterExpr = ToCharacter(Decimal(456), right)
+    assert(toCharacterExpr.checkInputDataTypes() ==
+      DataTypeMismatch(
+        errorSubClass = "NON_FOLDABLE_INPUT",
+        messageParameters = Map(
+          "inputName" -> "`attributereference`",
+          "inputType" -> toSQLType(right.dataType),
+          "inputExpr" -> toSQLExpr(right)
+        )
+      )
+    )
   }
 
   test("ToNumber: negative tests (the input string does not match the format string)") {
@@ -1106,6 +1211,8 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       // The trailing PR required exactly one leading < and trailing >.
       ("<454", "999PR"),
       ("454>", "999PR"),
+      ("<454 ", "999PR"),
+      (" 454>", "999PR"),
       ("<<454>>", "999PR"),
       // At least three digits were required.
       ("45", "S$999,099.99"),
@@ -1116,13 +1223,40 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     ).foreach { case (str: String, format: String) =>
       val toNumberExpr = ToNumber(Literal(str), Literal(format))
       assert(toNumberExpr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkExceptionInExpression[IllegalArgumentException](
+
+      checkExceptionInExpression[SparkIllegalArgumentException](
         toNumberExpr, "does not match the given number format")
 
       val tryToNumberExpr = TryToNumber(Literal(str), Literal(format))
       assert(tryToNumberExpr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(tryToNumberExpr, null)
     }
+  }
+
+  test("ToNumber: fails analysis if numberFormat is not foldable") {
+    val right = AttributeReference("a", StringType)()
+    val toNumberExpr = ToNumber(Literal("123456"), right)
+    assert(toNumberExpr.checkInputDataTypes() ==
+      DataTypeMismatch(
+        errorSubClass = "NON_FOLDABLE_INPUT",
+        messageParameters = Map(
+          "inputName" -> "`attributereference`",
+          "inputType" -> toSQLType(right.dataType),
+          "inputExpr" -> toSQLExpr(right)
+        )
+      )
+    )
+  }
+
+  test("SPARK-41118: ToNumber: null format string") {
+    // if null format, to_number should return null
+    val toNumberExpr = ToNumber(Literal("454"), Literal(null, StringType))
+    assert(toNumberExpr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
+    checkEvaluation(toNumberExpr, null)
+
+    val tryToNumberExpr = TryToNumber(Literal("454"), Literal(null, StringType))
+    assert(tryToNumberExpr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
+    checkEvaluation(tryToNumberExpr, null)
   }
 
   test("ToCharacter: positive tests") {
@@ -1151,10 +1285,6 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
         "00454"
     ).foreach { case ((decimal, format), expected) =>
       var expr: Expression = ToCharacter(Literal(decimal), Literal(format))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format))
       assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(expr, expected)
     }
@@ -1191,14 +1321,6 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       expr = ToCharacter(Literal(decimal), Literal(format2))
       assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format2))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
     }
 
     Seq(
@@ -1223,10 +1345,6 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
         " 4542 "
     ).foreach { case ((decimal, format), expected) =>
       var expr: Expression = ToCharacter(Literal(decimal), Literal(format))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format))
       assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(expr, expected)
     }
@@ -1258,14 +1376,6 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       checkEvaluation(expr, expected)
 
       expr = ToCharacter(Literal(decimal), Literal(format2))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format2))
       assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(expr, expected)
     }
@@ -1320,10 +1430,6 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       var expr: Expression = ToCharacter(Literal(decimal), Literal(format))
       assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
     }
 
     // Test '$'
@@ -1336,10 +1442,6 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
         "$78.12"
     ).foreach { case ((decimal, format), expected) =>
       var expr: Expression = ToCharacter(Literal(decimal), Literal(format))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format))
       assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(expr, expected)
     }
@@ -1377,10 +1479,6 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       var expr: Expression = ToCharacter(Literal(decimal), Literal(format))
       assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
     }
 
     // Test 'MI'
@@ -1411,10 +1509,6 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
         "               -4.310000000000000"
     ).foreach { case ((decimal, format), expected) =>
       var expr: Expression = ToCharacter(Literal(decimal), Literal(format))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format))
       assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(expr, expected)
     }
@@ -1452,10 +1546,6 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       var expr: Expression = ToCharacter(Literal(decimal), Literal(format))
       assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
     }
 
     // Test overflows
@@ -1476,10 +1566,6 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
         "##.#"
     ).foreach { case ((decimal, format), expected) =>
       var expr: Expression = ToCharacter(Literal(decimal), Literal(format))
-      assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
-      checkEvaluation(expr, expected)
-
-      expr = TryToCharacter(Literal(decimal), Literal(format))
       assert(expr.checkInputDataTypes() == TypeCheckResult.TypeCheckSuccess)
       checkEvaluation(expr, expected)
     }
@@ -1536,12 +1622,43 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     }
 
     // arguments checking
-    assert(ParseUrl(Seq(Literal("1"))).checkInputDataTypes().isFailure)
-    assert(ParseUrl(Seq(Literal("1"), Literal("2"), Literal("3"), Literal("4")))
-      .checkInputDataTypes().isFailure)
-    assert(ParseUrl(Seq(Literal("1"), Literal(2))).checkInputDataTypes().isFailure)
-    assert(ParseUrl(Seq(Literal(1), Literal("2"))).checkInputDataTypes().isFailure)
-    assert(ParseUrl(Seq(Literal("1"), Literal("2"), Literal(3))).checkInputDataTypes().isFailure)
+    assert(ParseUrl(Seq(Literal("1"))).checkInputDataTypes() == DataTypeMismatch(
+      errorSubClass = "WRONG_NUM_ARGS",
+      messageParameters = Map(
+        "functionName" -> "`parse_url`",
+        "expectedNum" -> "[2, 3]",
+        "actualNum" -> "1")
+    ))
+    assert(ParseUrl(Seq(Literal("1"), Literal("2"), Literal("3"),
+      Literal("4"))).checkInputDataTypes() == DataTypeMismatch(
+      errorSubClass = "WRONG_NUM_ARGS",
+      messageParameters = Map(
+        "functionName" -> "`parse_url`",
+        "expectedNum" -> "[2, 3]",
+        "actualNum" -> "4")
+    ))
+    assert(ParseUrl(Seq(Literal("1"), Literal(2))).checkInputDataTypes() == DataTypeMismatch(
+      errorSubClass = "UNEXPECTED_INPUT_TYPE",
+      messageParameters = Map(
+        "paramIndex" -> "2",
+        "requiredType" -> "\"STRING\"",
+        "inputSql" -> "\"2\"",
+        "inputType" -> "\"INT\"")))
+    assert(ParseUrl(Seq(Literal(1), Literal("2"))).checkInputDataTypes() == DataTypeMismatch(
+      errorSubClass = "UNEXPECTED_INPUT_TYPE",
+      messageParameters = Map(
+        "paramIndex" -> "1",
+        "requiredType" -> "\"STRING\"",
+        "inputSql" -> "\"1\"",
+        "inputType" -> "\"INT\"")))
+    assert(ParseUrl(Seq(Literal("1"), Literal("2"),
+      Literal(3))).checkInputDataTypes() == DataTypeMismatch(
+      errorSubClass = "UNEXPECTED_INPUT_TYPE",
+      messageParameters = Map(
+        "paramIndex" -> "3",
+        "requiredType" -> "\"STRING\"",
+        "inputSql" -> "\"3\"",
+        "inputType" -> "\"INT\"")))
 
     // Test escaping of arguments
     GenerateUnsafeProjection.generate(ParseUrl(Seq(Literal("\"quote"), Literal("\"quote"))) :: Nil)
@@ -1624,5 +1741,52 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(Contains(Literal("Spark SQL"), Literal("SPARK")), false)
     checkEvaluation(Contains(Literal("Spark SQL"), Literal("SQL")), true)
     checkEvaluation(Contains(Literal("Spark SQL"), Literal("k S")), true)
+  }
+
+  test("Elt: checkInputDataTypes") {
+    // requires at least two arguments
+    val indexExpr1 = Literal(8)
+    val expr1 = Elt(Seq(indexExpr1))
+    assert(expr1.checkInputDataTypes() ==
+      DataTypeMismatch(
+        errorSubClass = "WRONG_NUM_ARGS",
+        messageParameters = Map(
+          "functionName" -> "`elt`",
+          "expectedNum" -> "> 1",
+          "actualNum" -> "1"
+        )
+      )
+    )
+
+    // first input to function etl should have IntegerType
+    val indexExpr2 = Literal('a')
+    val expr2 = Elt(Seq(indexExpr2, Literal('b')))
+    assert(expr2.checkInputDataTypes() ==
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_INPUT_TYPE",
+        messageParameters = Map(
+          "paramIndex" -> "1",
+          "requiredType" -> toSQLType(IntegerType),
+          "inputSql" -> toSQLExpr(indexExpr2),
+          "inputType" -> toSQLType(indexExpr2.dataType)
+        )
+      )
+    )
+
+    // input to function etl should have StringType or BinaryType
+    val indexExpr3 = Literal(1)
+    val inputExpr3 = Seq(Literal('a'), Literal('b'), Literal(12345))
+    val expr3 = Elt(indexExpr3 +: inputExpr3)
+    assert(expr3.checkInputDataTypes() ==
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_INPUT_TYPE",
+        messageParameters = Map(
+          "paramIndex" -> "2...",
+          "requiredType" -> (toSQLType(StringType) + " or " + toSQLType(BinaryType)),
+          "inputSql" -> inputExpr3.map(toSQLExpr(_)).mkString(","),
+          "inputType" -> inputExpr3.map(expr => toSQLType(expr.dataType)).mkString(",")
+        )
+      )
+    )
   }
 }

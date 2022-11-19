@@ -20,8 +20,10 @@ package org.apache.spark.sql.catalyst.util
 import scala.collection.mutable
 
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{DataTypeMismatch, TypeCheckSuccess}
+import org.apache.spark.sql.catalyst.expressions.Cast._
 import org.apache.spark.sql.errors.QueryExecutionErrors
-import org.apache.spark.sql.types.{Decimal, DecimalType}
+import org.apache.spark.sql.types.{Decimal, DecimalType, StringType}
 import org.apache.spark.unsafe.types.UTF8String
 
 // This object contains some definitions of characters and tokens for the parser below.
@@ -253,22 +255,7 @@ class ToNumberParser(numberFormat: String, errorOnFail: Boolean) extends Seriali
    */
   def parsedDecimalType: DecimalType = DecimalType(precision, scale)
 
-  /**
-   * Consumes the format string to check validity and computes an appropriate Decimal output type.
-   */
-  def check(): TypeCheckResult = {
-    val validateResult: String = validateFormatString
-    if (validateResult.nonEmpty) {
-      TypeCheckResult.TypeCheckFailure(validateResult)
-    } else {
-      TypeCheckResult.TypeCheckSuccess
-    }
-  }
-
-  /**
-   * This implementation of the [[check]] method returns any error, or the empty string on success.
-   */
-  private def validateFormatString: String = {
+  def checkInputDataTypes(): TypeCheckResult = {
     val firstDollarSignIndex: Int = formatTokens.indexOf(DollarSign())
     val firstDigitIndex: Int = formatTokens.indexWhere {
       case _: DigitGroups => true
@@ -294,22 +281,37 @@ class ToNumberParser(numberFormat: String, errorOnFail: Boolean) extends Seriali
 
     // Make sure the format string contains at least one token.
     if (numberFormat.isEmpty) {
-      return "The format string cannot be empty"
+      return DataTypeMismatch(
+        errorSubClass = "FORMAT_EMPTY",
+        messageParameters = Map.empty
+      )
     }
     // Make sure the format string contains at least one digit.
     if (!formatTokens.exists(
       token => token.isInstanceOf[DigitGroups])) {
-      return "The format string requires at least one number digit"
+      return DataTypeMismatch(
+        errorSubClass = "FORMAT_WRONG_NUM_DIGIT",
+        messageParameters = Map.empty
+      )
     }
     // Make sure that any dollar sign in the format string occurs before any digits.
     if (firstDigitIndex < firstDollarSignIndex) {
-      return s"Currency characters must appear before digits in the number format: '$numberFormat'"
+      return DataTypeMismatch(
+        errorSubClass = "FORMAT_CUR_MUST_BEFORE_DIGIT",
+        messageParameters = Map(
+          "format" -> toSQLValue(numberFormat, StringType)
+        )
+      )
     }
     // Make sure that any dollar sign in the format string occurs before any decimal point.
     if (firstDecimalPointIndex != -1 &&
       firstDecimalPointIndex < firstDollarSignIndex) {
-      return "Currency characters must appear before any decimal point in the " +
-        s"number format: '$numberFormat'"
+      return DataTypeMismatch(
+        errorSubClass = "FORMAT_CUR_MUST_BEFORE_DEC",
+        messageParameters = Map(
+          "format" -> toSQLValue(numberFormat, StringType)
+        )
+      )
     }
     // Make sure that any thousands separators in the format string have digits before and after.
     if (digitGroupsBeforeDecimalPoint.exists {
@@ -325,16 +327,24 @@ class ToNumberParser(numberFormat: String, errorOnFail: Boolean) extends Seriali
             false
         })
     }) {
-      return "Thousands separators (, or G) must have digits in between them " +
-        s"in the number format: '$numberFormat'"
+      return DataTypeMismatch(
+        errorSubClass = "FORMAT_CONT_THOUSANDS_SEPS",
+        messageParameters = Map(
+          "format" -> toSQLValue(numberFormat, StringType)
+        )
+      )
     }
     // Make sure that thousands separators does not appear after the decimal point, if any.
     if (digitGroupsAfterDecimalPoint.exists {
       case DigitGroups(tokens, digits) =>
         tokens.length > digits.length
     }) {
-      return "Thousands separators (, or G) may not appear after the decimal point " +
-        s"in the number format: '$numberFormat'"
+      return DataTypeMismatch(
+        errorSubClass = "FORMAT_THOUSANDS_SEPS_MUST_BEFORE_DEC",
+        messageParameters = Map(
+          "format" -> toSQLValue(numberFormat, StringType)
+        )
+      )
     }
     // Make sure that the format string does not contain any prohibited duplicate tokens.
     val inputTokenCounts = formatTokens.groupBy(identity).mapValues(_.size)
@@ -344,7 +354,13 @@ class ToNumberParser(numberFormat: String, errorOnFail: Boolean) extends Seriali
       DollarSign(),
       ClosingAngleBracket()).foreach {
       token => if (inputTokenCounts.getOrElse(token, 0) > 1) {
-        return s"At most one ${token.toString} is allowed in the number format: '$numberFormat'"
+        return DataTypeMismatch(
+          errorSubClass = "FORMAT_WRONG_NUM_TOKEN",
+          messageParameters = Map(
+            "token" -> token.toString,
+            "format" -> toSQLValue(numberFormat, StringType)
+          )
+        )
       }
     }
     // Enforce the ordering of tokens in the format string according to this specification:
@@ -377,12 +393,16 @@ class ToNumberParser(numberFormat: String, errorOnFail: Boolean) extends Seriali
       }
     }
     if (formatTokenIndex < formatTokens.length) {
-      return s"Unexpected ${formatTokens(formatTokenIndex).toString} found in the format string " +
-        s"'$numberFormat'; the structure of the format string must match: " +
-        "[MI|S] [$] [0|9|G|,]* [.|D] [0|9]* [$] [PR|MI|S]"
+      return DataTypeMismatch(
+        errorSubClass = "FORMAT_UNEXPECTED_TOKEN",
+        messageParameters = Map(
+          "token" -> formatTokens(formatTokenIndex).toString,
+          "format" -> toSQLValue(numberFormat, StringType)
+        )
+      )
     }
     // Validation of the format string finished successfully.
-    ""
+    TypeCheckSuccess
   }
 
   /**
@@ -403,6 +423,9 @@ class ToNumberParser(numberFormat: String, errorOnFail: Boolean) extends Seriali
     parsedAfterDecimalPoint.clear()
     // Tracks whether we've reached the decimal point yet in either parsing or formatting.
     var reachedDecimalPoint = false
+    // Record whether we have consumed opening angle bracket characters in the input string.
+    var reachedOpeningAngleBracket = false
+    var reachedClosingAngleBracket = false
     // Record whether the input specified a negative result, such as with a minus sign.
     var negateResult = false
     // This is an index into the characters of the provided input string.
@@ -413,66 +436,79 @@ class ToNumberParser(numberFormat: String, errorOnFail: Boolean) extends Seriali
     // Iterate through the tokens representing the provided format string, in order.
     while (formatIndex < formatTokens.size) {
       val token: InputToken = formatTokens(formatIndex)
+      val inputChar: Option[Char] =
+        if (inputIndex < inputLength) {
+          Some(inputString(inputIndex))
+        } else {
+          Option.empty[Char]
+        }
       token match {
         case d: DigitGroups =>
           inputIndex = parseDigitGroups(d, inputString, inputIndex, reachedDecimalPoint).getOrElse(
             return formatMatchFailure(input, numberFormat))
         case DecimalPoint() =>
-          if (inputIndex < inputLength &&
-            inputString(inputIndex) == POINT_SIGN) {
-            reachedDecimalPoint = true
-            inputIndex += 1
-          } else {
-            // There is no decimal point. Consume the token and remain at the same character in the
-            // input string.
+          inputChar.foreach {
+            case POINT_SIGN =>
+              reachedDecimalPoint = true
+              inputIndex += 1
+            case _ =>
+              // There is no decimal point. Consume the token and remain at the same character in
+              // the input string.
           }
         case DollarSign() =>
-          if (inputIndex >= inputLength ||
-            inputString(inputIndex) != DOLLAR_SIGN) {
-            // The input string did not contain an expected dollar sign.
-            return formatMatchFailure(input, numberFormat)
+          inputChar.foreach {
+            case DOLLAR_SIGN =>
+              inputIndex += 1
+            case _ =>
+              // The input string did not contain an expected dollar sign.
+              return formatMatchFailure(input, numberFormat)
           }
-          inputIndex += 1
         case OptionalPlusOrMinusSign() =>
-          if (inputIndex < inputLength &&
-            inputString(inputIndex) == PLUS_SIGN) {
-            inputIndex += 1
-          } else if (inputIndex < inputLength &&
-            inputString(inputIndex) == MINUS_SIGN) {
-            negateResult = !negateResult
-            inputIndex += 1
-          } else {
-            // There is no plus or minus sign. Consume the token and remain at the same character in
-            // the input string.
+          inputChar.foreach {
+            case PLUS_SIGN =>
+              inputIndex += 1
+            case MINUS_SIGN =>
+              negateResult = !negateResult
+              inputIndex += 1
+            case _ =>
+              // There is no plus or minus sign. Consume the token and remain at the same character
+              // in the input string.
           }
         case OptionalMinusSign() =>
-          if (inputIndex < inputLength &&
-            inputString(inputIndex) == MINUS_SIGN) {
-            negateResult = !negateResult
-            inputIndex += 1
-          } else {
-            // There is no minus sign. Consume the token and remain at the same character in the
-            // input string.
+          inputChar.foreach {
+            case MINUS_SIGN =>
+              negateResult = !negateResult
+              inputIndex += 1
+            case _ =>
+              // There is no minus sign. Consume the token and remain at the same character in the
+              // input string.
           }
         case OpeningAngleBracket() =>
-          if (inputIndex >= inputLength ||
-            inputString(inputIndex) != ANGLE_BRACKET_OPEN) {
-            // The input string did not contain an expected opening angle bracket.
-            return formatMatchFailure(input, numberFormat)
+          inputChar.foreach {
+            case ANGLE_BRACKET_OPEN =>
+              if (reachedOpeningAngleBracket) {
+                return formatMatchFailure(input, numberFormat)
+              }
+              reachedOpeningAngleBracket = true
+              inputIndex += 1
+            case _ =>
           }
-          inputIndex += 1
         case ClosingAngleBracket() =>
-          if (inputIndex >= inputLength ||
-            inputString(inputIndex) != ANGLE_BRACKET_CLOSE) {
-            // The input string did not contain an expected closing angle bracket.
-            return formatMatchFailure(input, numberFormat)
+          inputChar.foreach {
+            case ANGLE_BRACKET_CLOSE =>
+              if (!reachedOpeningAngleBracket) {
+                return formatMatchFailure(input, numberFormat)
+              }
+              reachedClosingAngleBracket = true
+              negateResult = !negateResult
+              inputIndex += 1
+            case _ =>
           }
-          negateResult = !negateResult
-          inputIndex += 1
       }
       formatIndex += 1
     }
-    if (inputIndex < inputLength) {
+    if (inputIndex < inputLength ||
+      reachedOpeningAngleBracket != reachedClosingAngleBracket) {
       // If we have consumed all the tokens in the format string, but characters remain unconsumed
       // in the input string, then the input string does not match the format string.
       formatMatchFailure(input, numberFormat)
@@ -516,7 +552,7 @@ class ToNumberParser(numberFormat: String, errorOnFail: Boolean) extends Seriali
       // The input contains more thousands separators than the format string.
       return None
     }
-    for (i <- 0 until expectedDigits.length) {
+    for (i <- expectedDigits.indices) {
       val expectedToken: Digits = expectedDigits(i)
       val actualNumDigits: Int =
         if (i < parsedDigitGroupSizes.length) {

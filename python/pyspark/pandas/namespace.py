@@ -90,7 +90,6 @@ from pyspark.pandas.internal import (
     SPARK_INDEX_NAME_FORMAT,
 )
 from pyspark.pandas.series import Series, first_series
-from pyspark.pandas.spark import functions as SF
 from pyspark.pandas.spark.utils import as_nullable_spark_type, force_decimal_precision_scale
 from pyspark.pandas.indexes import Index, DatetimeIndex, TimedeltaIndex
 from pyspark.pandas.indexes.multi import MultiIndex
@@ -214,7 +213,7 @@ def range(
 
 
 def read_csv(
-    path: str,
+    path: Union[str, List[str]],
     sep: str = ",",
     header: Union[str, int, None] = "infer",
     names: Optional[Union[str, List[str]]] = None,
@@ -235,10 +234,10 @@ def read_csv(
 
     Parameters
     ----------
-    path : str
-        The path string storing the CSV file to be read.
+    path : str or list
+        Path(s) of the CSV file(s) to be read.
     sep : str, default ‘,’
-        Delimiter to use. Must be a single character.
+        Delimiter to use. Non empty string.
     header : int, default ‘infer’
         Whether to to use as the column names, and the start of the data.
         Default behavior is to infer the column names: if no names are passed
@@ -278,7 +277,7 @@ def read_csv(
         The character used to denote the start and end of a quoted item. Quoted items can include
         the delimiter and it will be ignored.
     escapechar : str (length 1), default None
-        One-character string used to escape delimiter
+        One-character string used to escape other characters.
     comment: str, optional
         Indicates the line should not be parsed.
     encoding: str, optional
@@ -297,6 +296,10 @@ def read_csv(
     Examples
     --------
     >>> ps.read_csv('data.csv')  # doctest: +SKIP
+
+    Load multiple CSV files as a single DataFrame:
+
+    >>> ps.read_csv(['data-01.csv', 'data-02.csv'])  # doctest: +SKIP
     """
     # For latin-1 encoding is same as iso-8859-1, that's why its mapped to iso-8859-1.
     encoding_mapping = {"latin-1": "iso-8859-1"}
@@ -1192,7 +1195,7 @@ def read_excel(
                 )
 
                 reset_index = pdf.reset_index()
-                for name, col in reset_index.iteritems():
+                for name, col in reset_index.items():
                     dt = col.dtype
                     if is_datetime64_dtype(dt) or is_datetime64tz_dtype(dt):
                         continue
@@ -2621,9 +2624,8 @@ def concat(
 
             assert len(merged_columns) > 0
 
-            # If sort is True, always sort when there are more than two Series,
-            # and if there is only one Series, never sort to follow pandas 1.4+ behavior.
-            if sort and num_series != 1:
+            # If sort is True, always sort
+            if sort:
                 # FIXME: better ordering
                 merged_columns = sorted(merged_columns, key=name_like_string)
 
@@ -2634,7 +2636,7 @@ def concat(
                 # TODO: NaN and None difference for missing values. pandas seems filling NaN.
                 sdf = psdf._internal.resolved_copy.spark_frame
                 for label in columns_to_add:
-                    sdf = sdf.withColumn(name_like_string(label), SF.lit(None))
+                    sdf = sdf.withColumn(name_like_string(label), F.lit(None))
 
                 data_columns = psdf._internal.data_spark_column_names + [
                     name_like_string(label) for label in columns_to_add
@@ -3406,7 +3408,7 @@ def merge_asof(
         on = None
 
     if tolerance is not None and not isinstance(tolerance, Column):
-        tolerance = SF.lit(tolerance)
+        tolerance = F.lit(tolerance)
 
     as_of_joined_table = left_table._joinAsOf(
         right_table,

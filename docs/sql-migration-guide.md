@@ -22,6 +22,20 @@ license: |
 * Table of contents
 {:toc}
 
+## Upgrading from Spark SQL 3.3 to 3.4
+  
+  - Since Spark 3.4, Number or Number(\*) from Teradata will be treated as Decimal(38,18). In Spark 3.3 or earlier, Number or Number(\*) from Teradata will be treated as Decimal(38, 0), in which case the fractional part will be removed.
+  - Since Spark 3.4, v1 database, table, permanent view and function identifier will include 'spark_catalog' as the catalog name if database is defined, e.g. a table identifier will be: `spark_catalog.default.t`. To restore the legacy behavior, set `spark.sql.legacy.v1IdentifierNoCatalog` to `true`.
+  - Since Spark 3.4, when ANSI SQL mode(configuration `spark.sql.ansi.enabled`) is on, Spark SQL always returns NULL result on getting a map value with a non-existing key. In Spark 3.3 or earlier, there will be an error.
+  - Since Spark 3.4, the SQL CLI `spark-sql` does not print the prefix `Error in query:` before the error message of `AnalysisException`.
+  - Since Spark 3.4, `split` function ignores trailing empty strings when `regex` parameter is empty.
+  - Since Spark 3.4, the `to_binary` function throws error for a malformed `str` input. Use `try_to_binary` to tolerate malformed input and return NULL instead.
+    - Valid Base64 string should include symbols from in base64 alphabet (A-Za-z0-9+/), optional padding (`=`), and optional whitespaces. Whitespaces are skipped in conversion except when they are preceded by padding symbol(s). If padding is present it should conclude the string and follow rules described in RFC 4648 § 4.
+    - Valid hexadecimal strings should include only allowed symbols (0-9A-Fa-f).
+    - Valid values for `fmt` are case-insensitive `hex`, `base64`, `utf-8`, `utf8`.
+  - Since Spark 3.4, Spark throws only `PartitionsAlreadyExistException` when it creates partitions but some of them exist already. In Spark 3.3 or earlier, Spark can throw either `PartitionsAlreadyExistException` or `PartitionAlreadyExistsException`.
+  - Since Spark 3.4, Spark will do validation for partition spec in ALTER PARTITION to follow the behavior of `spark.sql.storeAssignmentPolicy` which may cause an exception if type conversion fails, e.g. `ALTER TABLE .. ADD PARTITION(p='a')` if column `p` is int type. To restore the legacy behavior, set `spark.sql.legacy.skipTypeValidationOnAlterPartition` to `true`.
+
 ## Upgrading from Spark SQL 3.2 to 3.3
 
   - Since Spark 3.3, the `histogram_numeric` function in Spark SQL returns an output type of an array of structs (x, y), where the type of the 'x' field in the return value is propagated from the input values consumed in the aggregate function. In Spark 3.2 or earlier, 'x' always had double type. Optionally, use the configuration `spark.sql.legacy.histogramNumericPropagateInputType` since Spark 3.3 to revert back to the previous behavior. 
@@ -67,6 +81,8 @@ license: |
   - Since Spark 3.3, Spark will try to use built-in data source writer instead of Hive serde in `INSERT OVERWRITE DIRECTORY`. This behavior is effective only if `spark.sql.hive.convertMetastoreParquet` or `spark.sql.hive.convertMetastoreOrc` is enabled respectively for Parquet and ORC formats. To restore the behavior before Spark 3.3, you can set `spark.sql.hive.convertMetastoreInsertDir` to `false`.
   
   - Since Spark 3.3, the precision of the return type of round-like functions has been fixed. This may cause Spark throw `AnalysisException` of the `CANNOT_UP_CAST_DATATYPE` error class when using views created by prior versions. In such cases, you need to recreate the views using ALTER VIEW AS or CREATE OR REPLACE VIEW AS with newer Spark versions.
+
+  - Since Spark 3.3.1 and 3.2.3, for `SELECT ... GROUP BY a GROUPING SETS (b)`-style SQL statements, `grouping__id` returns different values from Apache Spark 3.2.0, 3.2.1, 3.2.2, and 3.3.0. It computes based on user-given group-by expressions plus grouping set columns. To restore the behavior before 3.3.1 and 3.2.3, you can set `spark.sql.legacy.groupingIdWithAppendedUserGroupBy`. For details, see [SPARK-40218](https://issues.apache.org/jira/browse/SPARK-40218) and [SPARK-40562](https://issues.apache.org/jira/browse/SPARK-40562).
 
 ## Upgrading from Spark SQL 3.1 to 3.2
 
@@ -820,11 +836,11 @@ and deprecated the old APIs (e.g., `SQLContext.parquetFile`, `SQLContext.jsonFil
 See the API docs for `SQLContext.read` (
   <a href="api/scala/org/apache/spark/sql/SQLContext.html#read:DataFrameReader">Scala</a>,
   <a href="api/java/org/apache/spark/sql/SQLContext.html#read()">Java</a>,
-  <a href="api/python/reference/api/pyspark.sql.SparkSession.read.html#pyspark.sql.SparkSession.read">Python</a>
+  <a href="api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.read.html#pyspark.sql.SparkSession.read">Python</a>
 ) and `DataFrame.write` (
   <a href="api/scala/org/apache/spark/sql/DataFrame.html#write:DataFrameWriter">Scala</a>,
   <a href="api/java/org/apache/spark/sql/Dataset.html#write()">Java</a>,
-  <a href="api/python/reference/api/pyspark.sql.DataFrame.write.html#pyspark.sql.DataFrame.write">Python</a>
+  <a href="api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.write.html#pyspark.sql.DataFrame.write">Python</a>
 ) more information.
 
 
@@ -1096,12 +1112,6 @@ Spark SQL supports the vast majority of Hive features, such as:
 
 Below is a list of Hive features that we don't support yet. Most of these features are rarely used
 in Hive deployments.
-
-**Major Hive Features**
-
-* Tables with buckets: bucket is the hash partitioning within a Hive table partition. Spark SQL
-  doesn't support buckets yet.
-
 
 **Esoteric Hive Features**
 

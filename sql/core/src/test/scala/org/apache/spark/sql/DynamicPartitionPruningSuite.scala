@@ -22,7 +22,7 @@ import org.scalatest.GivenWhenThen
 import org.apache.spark.sql.catalyst.expressions.{DynamicPruningExpression, Expression}
 import org.apache.spark.sql.catalyst.expressions.CodegenObjectFactoryMode._
 import org.apache.spark.sql.catalyst.plans.ExistenceJoin
-import org.apache.spark.sql.connector.catalog.InMemoryTableCatalog
+import org.apache.spark.sql.connector.catalog.{InMemoryTableCatalog, InMemoryTableWithV2FilterCatalog}
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive._
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
@@ -1754,6 +1754,25 @@ class DynamicPartitionPruningV1SuiteAEOff extends DynamicPartitionPruningV1Suite
 class DynamicPartitionPruningV1SuiteAEOn extends DynamicPartitionPruningV1Suite
   with EnableAdaptiveExecutionSuite {
 
+  test("SPARK-39447: Avoid AssertionError in AdaptiveSparkPlanExec.doExecuteBroadcast") {
+    val df = sql(
+      """
+        |WITH empty_result AS (
+        |  SELECT * FROM fact_stats WHERE product_id < 0
+        |)
+        |SELECT *
+        |FROM   (SELECT /*+ SHUFFLE_MERGE(fact_sk) */ empty_result.store_id
+        |        FROM   fact_sk
+        |               JOIN empty_result
+        |                 ON fact_sk.product_id = empty_result.product_id) t2
+        |       JOIN empty_result
+        |         ON t2.store_id = empty_result.store_id
+      """.stripMargin)
+
+    checkPartitionPruningPredicate(df, false, false)
+    checkAnswer(df, Nil)
+  }
+
   test("SPARK-37995: PlanAdaptiveDynamicPruningFilters should use prepareExecutedPlan " +
     "rather than createSparkPlan to re-plan subquery") {
     withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
@@ -1785,4 +1804,21 @@ class DynamicPartitionPruningV2SuiteAEOff extends DynamicPartitionPruningV2Suite
   with DisableAdaptiveExecutionSuite
 
 class DynamicPartitionPruningV2SuiteAEOn extends DynamicPartitionPruningV2Suite
+  with EnableAdaptiveExecutionSuite
+
+abstract class DynamicPartitionPruningV2FilterSuite
+    extends DynamicPartitionPruningV2Suite {
+
+  override protected def initState(): Unit = {
+    super.initState()
+    spark.conf.set("spark.sql.catalog.testcat", classOf[InMemoryTableWithV2FilterCatalog].getName)
+  }
+}
+
+class DynamicPartitionPruningV2FilterSuiteAEOff
+    extends DynamicPartitionPruningV2FilterSuite
+  with DisableAdaptiveExecutionSuite
+
+class DynamicPartitionPruningV2FilterSuiteAEOn
+    extends DynamicPartitionPruningV2FilterSuite
   with EnableAdaptiveExecutionSuite
